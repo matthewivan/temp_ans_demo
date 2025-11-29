@@ -1,3 +1,11 @@
+# Files Modified
+
+android/build.gradle.kts
+android/app/build.gradle.kts
+android/app/src/main/AndroidManifest.xml
+android/app/src/main/kotlin/com/example/untitled/MainActivity.kt
+lib/main.dart
+
 # untitled
 
 A new Flutter project.
