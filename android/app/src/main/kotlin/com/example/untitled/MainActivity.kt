@@ -9,20 +9,23 @@ import com.polar.androidcommunications.api.ble.model.DisInfo
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.EventChannel
 
 import com.polar.sdk.api.PolarBleApi
 import com.polar.sdk.api.PolarBleApiCallback
 import com.polar.sdk.api.PolarBleApiDefaultImpl
-import com.polar.sdk.api.model.PolarDeviceInfo
-import com.polar.sdk.api.model.PolarHealthThermometerData
-import com.polar.sdk.api.model.PolarHrData
-import java.util.UUID
+import com.polar.sdk.api.model.*
+//import com.polar.sdk.api.model.PolarDeviceInfo
+//import com.polar.sdk.api.model.PolarHrData
+//import com.polar.sdk.api.model.PolarEcgData
+//import com.polar.sdk.api.model.PolarAccelerometerData
+//import com.polar.sdk.api.model.PolarSensorSetting
+//import java.util.UUID
 
 import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers
 import io.reactivex.rxjava3.disposables.CompositeDisposable
 import io.reactivex.rxjava3.disposables.Disposable
 import io.reactivex.rxjava3.schedulers.Schedulers
-
 
 class MainActivity : FlutterActivity() {
 
@@ -36,6 +39,10 @@ class MainActivity : FlutterActivity() {
     private val disposables = CompositeDisposable()
     private var connectedDeviceId: String? = null
 
+    private var ecgSink: EventChannel.EventSink? = null
+    private var rrSink: EventChannel.EventSink? = null
+    private var accSink: EventChannel.EventSink? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestBlePermissions()
@@ -44,10 +51,12 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        // Initialize Polar API with only HR feature enabled
         api = PolarBleApiDefaultImpl.defaultImplementation(
             applicationContext,
-            setOf(PolarBleApi.PolarBleSdkFeature.FEATURE_HR)
+            setOf(
+                PolarBleApi.PolarBleSdkFeature.FEATURE_HR,
+                PolarBleApi.PolarBleSdkFeature.FEATURE_POLAR_ONLINE_STREAMING
+            )
         )
 
         api.setApiCallback(object : PolarBleApiCallback() {
@@ -67,48 +76,94 @@ class MainActivity : FlutterActivity() {
 
             override fun deviceDisconnected(polarDeviceInfo: PolarDeviceInfo) {
                 Log.d(TAG, "DISCONNECTED: ${polarDeviceInfo.deviceId}")
-                if (connectedDeviceId == polarDeviceInfo.deviceId) {
-                    connectedDeviceId = null
-                }
+                if (connectedDeviceId == polarDeviceInfo.deviceId) connectedDeviceId = null
             }
 
             override fun disInformationReceived(
                 identifier: String,
                 disInfo: DisInfo
             ) {
-                Log.d(TAG, "DIS info from $identifier: $disInfo")
+                Log.d(TAG, "DIS info: $identifier,  $disInfo")
             }
-
-            override fun bleSdkFeatureReady(identifier: String, feature: PolarBleApi.PolarBleSdkFeature) {
-                Log.d(TAG, "Polar BLE SDK feature $feature is ready for $identifier")
-            }
-
-/*
-            override fun disInformationReceived(identifier: String, uuid: UUID, value: String) {
-                Log.d(TAG, "DIS info from $identifier: uuid=$uuid value=$value")
-            }
-*/
 
             override fun htsNotificationReceived(
                 identifier: String,
                 data: PolarHealthThermometerData
             ) {
-                Log.d(TAG, "HTS notification from $identifier: $data")
+                Log.d(TAG, "Thermometer Data: $identifier: $data")
             }
 
+            /*
+                        override fun disInformationReceived(identifier: String, uuid: UUID, value: String) {
+                            Log.d(TAG, "DIS info: $identifier  $uuid = $value")
+                        }
+            */
+
             override fun batteryLevelReceived(identifier: String, level: Int) {
-                Log.d(TAG, "Battery level from $identifier: $level")
+                Log.d(TAG, "Battery: $identifier  level = $level")
             }
         })
 
+
+        // EVENT CHANNELS
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "polar_h10_sdk/ecg_stream"
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(args: Any?, events: EventChannel.EventSink?) {
+                ecgSink = events
+                startEcg()
+            }
+
+            override fun onCancel(args: Any?) {
+                ecgSink = null
+            }
+        })
+
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "polar_h10_sdk/rr_stream"
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(args: Any?, events: EventChannel.EventSink?) {
+                rrSink = events
+                startHr()
+            }
+
+            override fun onCancel(args: Any?) {
+                rrSink = null
+            }
+        })
+
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "polar_h10_sdk/acc_stream"
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(args: Any?, events: EventChannel.EventSink?) {
+                accSink = events
+                startAcc()
+            }
+
+            override fun onCancel(args: Any?) {
+                accSink = null
+            }
+        })
+
+
+        // METHOD CHANNEL
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             METHOD_CHANNEL
         ).setMethodCallHandler { call, result ->
             when (call.method) {
+
                 "searchAndConnect" -> searchAndConnect(result)
-                "getOneHrSample"    -> getOneHrSample(result)
-                else                -> result.notImplemented()
+                "getOneHrSample" -> getOneHrSample(result)
+
+                "startEcg" -> { startEcg(); result.success(null) }
+                "startHr"  -> { startHr();  result.success(null) }
+                "startAcc" -> { startAcc(); result.success(null) }
+
+                else -> result.notImplemented()
             }
         }
     }
@@ -119,78 +174,134 @@ class MainActivity : FlutterActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             permissions += Manifest.permission.BLUETOOTH_SCAN
             permissions += Manifest.permission.BLUETOOTH_CONNECT
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            permissions += Manifest.permission.ACCESS_FINE_LOCATION
         } else {
-            permissions += Manifest.permission.ACCESS_COARSE_LOCATION
+            permissions += Manifest.permission.ACCESS_FINE_LOCATION
         }
 
-        if (permissions.isNotEmpty()) {
-            ActivityCompat.requestPermissions(
-                this,
-                permissions.toTypedArray(),
-                PERMISSION_REQUEST_CODE
-            )
-        }
+        ActivityCompat.requestPermissions(
+            this,
+            permissions.toTypedArray(),
+            PERMISSION_REQUEST_CODE
+        )
     }
 
     private fun searchAndConnect(result: MethodChannel.Result) {
-        Log.d(TAG, "Starting searchForDevice()")
         val disposable = api.searchForDevice()
             .subscribeOn(Schedulers.io())
             .observeOn(AndroidSchedulers.mainThread())
-            .subscribe({ deviceInfo ->
-                Log.d(TAG, "Found device: ${deviceInfo.deviceId} ${deviceInfo.name}")
-
-                // You can filter to H10 specifically, e.g. by name or type
-                // For demo, just take the first Polar device and stop scanning.
-                disposables.clear()
-
-                try {
-                    api.connectToDevice(deviceInfo.deviceId)
-                    result.success(deviceInfo.deviceId)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error connecting: ${e.message}", e)
-                    result.error("CONNECT_ERROR", e.message, null)
-                }
-            }, { error ->
-                Log.e(TAG, "searchForDevice error: ${error.message}", error)
-                result.error("SEARCH_ERROR", error.message, null)
+            .subscribe({ info ->
+                Log.d(TAG, "Found: ${info.deviceId}")
+                api.connectToDevice(info.deviceId)
+                result.success(info.deviceId)
+            }, { err ->
+                result.error("SEARCH_ERROR", err.message, null)
             })
 
         disposables.add(disposable)
     }
 
     private fun getOneHrSample(result: MethodChannel.Result) {
-        val id = connectedDeviceId
-        if (id == null) {
-            result.error("NO_DEVICE", "No device connected", null)
-            return
-        }
-
-        Log.d(TAG, "Starting HR streaming for $id")
+        val id = connectedDeviceId ?: return result.error("NO_DEVICE", "Not connected", null)
 
         var disposable: Disposable? = null
         disposable = api.startHrStreaming(id)
             .subscribeOn(Schedulers.io())
             .observeOn(AndroidSchedulers.mainThread())
             .subscribe({ hrData ->
-                // PolarHrData typically contains a list of samples
                 val sample = hrData.samples.firstOrNull()
-                val hr = sample?.hr?.toInt() ?: -1
-                Log.d(TAG, "Received HR sample: $hr")
+                val hr = sample?.hr ?: -1
                 result.success(hr)
-
-                // After we got one sample, stop streaming for this simple demo
                 disposable?.dispose()
-            }, { error ->
-                Log.e(TAG, "HR streaming error: ${error.message}", error)
-                result.error("HR_ERROR", error.message, null)
+            }, { err ->
+                result.error("HR_ERROR", err.message, null)
             })
 
-        if (disposable != null) {
-            disposables.add(disposable)
-        }
+        disposables.add(disposable!!)
+    }
+
+    private fun startEcg() {
+        val id = connectedDeviceId ?: return
+
+        val disposable = api.requestStreamSettings(id, PolarBleApi.PolarDeviceDataType.ECG)
+            .flatMapPublisher { settings ->
+                api.startEcgStreaming(id, settings)
+            }
+            .subscribeOn(Schedulers.io())
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe({ ecgData ->
+                ecgData.samples.forEach { sample ->
+                    when (sample) {
+
+                        is EcgSample -> {
+                            // sample.voltage is Int (microvolts)
+                            val microVolts = sample.voltage
+                            ecgSink?.success(microVolts)
+                        }
+
+                        is FecgSample -> {
+                            // If you want fetal ECG, decide what to send.
+                            val payload = mapOf(
+                                "ecg" to sample.ecg,
+                                "bioz" to sample.bioz,
+                                "status" to sample.status.toInt()
+                            )
+                            ecgSink?.success(payload)
+                        }
+                    }
+                }
+            }, { error ->
+                Log.e(TAG, "ECG stream error", error)
+            })
+
+        disposables.add(disposable)
+    }
+
+    private fun startAcc() {
+        val id = connectedDeviceId ?: return
+
+        val disposable = api.requestStreamSettings(id, PolarBleApi.PolarDeviceDataType.ACC)
+            .flatMapPublisher { settings ->
+                api.startAccStreaming(id, settings)
+            }
+            .subscribeOn(Schedulers.io())
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe({ acc: PolarAccelerometerData ->
+                acc.samples.forEach { sample ->
+                    accSink?.success(
+                        mapOf(
+                            "x" to sample.x,
+                            "y" to sample.y,
+                            "z" to sample.z
+                        )
+                    )
+                }
+            }, { err ->
+                Log.e(TAG, "ACC error", err)
+            })
+
+        disposables.add(disposable)
+    }
+
+    private fun startHr() {
+        val id = connectedDeviceId ?: return
+
+        val disposable = api.startHrStreaming(id)
+            .subscribeOn(Schedulers.io())
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe({ hrData: PolarHrData ->
+                hrData.samples.forEach { sample ->
+                    rrSink?.success(
+                        mapOf(
+                            "hr" to sample.hr,
+                            "rr" to sample.rrsMs
+                        )
+                    )
+                }
+            }, { err ->
+                Log.e(TAG, "HR error", err)
+            })
+
+        disposables.add(disposable)
     }
 
     override fun onDestroy() {
