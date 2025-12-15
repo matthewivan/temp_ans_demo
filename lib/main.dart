@@ -1,3 +1,5 @@
+import 'recording_manager.dart';
+
 import 'dart:async';
 import 'dart:io';
 
@@ -30,6 +32,9 @@ class PolarHomePage extends StatefulWidget {
 }
 
 class _PolarHomePageState extends State<PolarHomePage> {
+  final recorder = RecordingManager();
+  bool recording = false;
+
   // NATIVE CHANNELS
   static const MethodChannel _channel =
   MethodChannel('polar_h10_sdk/methods');
@@ -47,6 +52,7 @@ class _PolarHomePageState extends State<PolarHomePage> {
   List<double> ecgBuffer = [];
   List<int> rrBuffer = [];
   List<Map<String, double>> accBuffer = [];
+  List<int> hrBuffer = []; // <-- FIX: continuous HR history
 
   StreamSubscription? ecgSub;
   StreamSubscription? rrSub;
@@ -54,11 +60,11 @@ class _PolarHomePageState extends State<PolarHomePage> {
 
   String _status = 'Idle';
   String? _deviceId;
-  int? _lastHr;
 
   // -------------------------------------------------------------------------
   // DEVICE CONNECTION
   // -------------------------------------------------------------------------
+
   Future<void> _searchAndConnect() async {
     if (!Platform.isAndroid) {
       setState(() => _status = 'Android only');
@@ -82,7 +88,6 @@ class _PolarHomePageState extends State<PolarHomePage> {
     try {
       final hr = await _channel.invokeMethod<int>('getOneHrSample');
       setState(() {
-        _lastHr = hr;
         _status = "One HR sample: $hr bpm";
       });
     } catch (e) {
@@ -99,6 +104,8 @@ class _PolarHomePageState extends State<PolarHomePage> {
     ecgSub = _ecgStream.receiveBroadcastStream().listen((value) {
       final v = (value as num).toDouble();
 
+      if (recording) recorder.writeEcg(v.toInt());
+
       setState(() {
         ecgBuffer.add(v);
         if (ecgBuffer.length > 600) ecgBuffer.removeAt(0);
@@ -110,15 +117,25 @@ class _PolarHomePageState extends State<PolarHomePage> {
     rrSub?.cancel();
     rrSub = _rrStream.receiveBroadcastStream().listen((event) {
       if (event is Map) {
-        final rrList =
-            (event["rr"] as List?)?.cast<int>() ?? [];
+        final rrList = (event["rr"] as List?)?.cast<int>() ?? [];
         final hrVal = event["hr"] as int?;
 
+        if (recording) {
+          recorder.writeRr(rrList, hrVal ?? 0);
+          if (hrVal != null) recorder.writeHr(hrVal);
+        }
+
         setState(() {
-          if (hrVal != null) _lastHr = hrVal;
           rrBuffer.addAll(rrList);
           if (rrBuffer.length > 200) {
             rrBuffer = rrBuffer.sublist(rrBuffer.length - 200);
+          }
+
+          if (hrVal != null) {
+            hrBuffer.add(hrVal);
+            if (hrBuffer.length > 200) {
+              hrBuffer = hrBuffer.sublist(hrBuffer.length - 200);
+            }
           }
         });
       }
@@ -129,11 +146,19 @@ class _PolarHomePageState extends State<PolarHomePage> {
     accSub?.cancel();
     accSub = _accStream.receiveBroadcastStream().listen((event) {
       if (event is Map) {
+        final x = (event["x"] as num?)?.toDouble();
+        final y = (event["y"] as num?)?.toDouble();
+        final z = (event["z"] as num?)?.toDouble();
+
+        if (recording && x != null && y != null && z != null) {
+          recorder.writeAcc(x, y, z);
+        }
+
         setState(() {
           accBuffer.add({
-            "x": (event["x"] as num).toDouble(),
-            "y": (event["y"] as num).toDouble(),
-            "z": (event["z"] as num).toDouble(),
+            "x": x ?? 0.0,
+            "y": y ?? 0.0,
+            "z": z ?? 0.0,
           });
 
           if (accBuffer.length > 300) accBuffer.removeAt(0);
@@ -149,9 +174,7 @@ class _PolarHomePageState extends State<PolarHomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text("Polar H10 SDK (Android)"),
-      ),
+      appBar: AppBar(title: const Text("Polar H10 SDK (Android)")),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -159,7 +182,6 @@ class _PolarHomePageState extends State<PolarHomePage> {
           children: [
             Text("Status: $_status"),
             Text("Device ID: ${_deviceId ?? "-"}"),
-            Text("Last HR: ${_lastHr ?? "-"} bpm"),
 
             const SizedBox(height: 20),
 
@@ -170,6 +192,38 @@ class _PolarHomePageState extends State<PolarHomePage> {
             ElevatedButton(
               onPressed: _getOneHrSample,
               child: const Text("Get 1 HR Sample"),
+            ),
+
+            ElevatedButton(
+              onPressed: () async {
+                await recorder.startRecording({
+                  "patient_id": "P01",
+                  "notes": "Test recording",
+                  "device_id": _deviceId,
+                  "start_time": DateTime.now().toIso8601String(),
+                });
+                setState(() => recording = true);
+              },
+              child: const Text("Start Recording"),
+            ),
+
+            ElevatedButton(
+              onPressed: () async {
+                await recorder.stopRecording();
+                setState(() => recording = false);
+              },
+              child: const Text("Stop Recording"),
+            ),
+
+            ElevatedButton(
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                      builder: (_) => const RecordingListPage()),
+                );
+              },
+              child: const Text("View Saved Recordings"),
             ),
 
             const SizedBox(height: 20),
@@ -186,25 +240,21 @@ class _PolarHomePageState extends State<PolarHomePage> {
               child: const Text("Start Accelerometer Stream"),
             ),
 
-            const SizedBox(height: 25),
+            const SizedBox(height: 30),
 
-            // ECG Graph
             const Text("ECG Signal"),
             SizedBox(height: 180, child: EcgGraph(data: ecgBuffer)),
             const SizedBox(height: 20),
 
-            // HR Graph
-            const Text("Heart Rate"),
-            SizedBox(height: 150, child: HrGraph(hr: _lastHr)),
+            const Text("Heart Rate (Continuous)"),
+            SizedBox(height: 180, child: HrGraph(hrList: hrBuffer)),
             const SizedBox(height: 20),
 
-            // RR Graph
-            const Text("RR Intervals (Tachogram)"),
+            const Text("RR Intervals"),
             SizedBox(height: 180, child: RrGraph(rr: rrBuffer)),
             const SizedBox(height: 20),
 
-            // ACC Graph
-            const Text("Accelerometer (XYZ)"),
+            const Text("Accelerometer"),
             SizedBox(height: 180, child: AccGraph(data: accBuffer)),
           ],
         ),
@@ -256,15 +306,17 @@ class EcgGraph extends StatelessWidget {
   }
 }
 
-// ---------------------------- HEART RATE ----------------------------
+// ---------------------------- HEART RATE GRAPH ----------------------------
 class HrGraph extends StatelessWidget {
-  final int? hr;
+  final List<int> hrList;
 
-  const HrGraph({super.key, required this.hr});
+  const HrGraph({super.key, required this.hrList});
 
   @override
   Widget build(BuildContext context) {
-    final double v = (hr ?? 0).toDouble();
+    if (hrList.isEmpty) {
+      return const Center(child: Text("No HR data"));
+    }
 
     return LineChart(
       LineChartData(
@@ -274,11 +326,14 @@ class HrGraph extends StatelessWidget {
         gridData: FlGridData(show: false),
         lineBarsData: [
           LineChartBarData(
-            spots: [FlSpot(0, v)],
-            isCurved: false,
-            barWidth: 6,
+            spots: [
+              for (int i = 0; i < hrList.length; i++)
+                FlSpot(i.toDouble(), hrList[i].toDouble())
+            ],
+            isCurved: true,
+            barWidth: 2,
             color: Colors.orange,
-            dotData: FlDotData(show: true),
+            dotData: FlDotData(show: false),
           ),
         ],
       ),
@@ -286,7 +341,7 @@ class HrGraph extends StatelessWidget {
   }
 }
 
-// ---------------------------- RR INTERVAL GRAPH ----------------------------
+// ---------------------------- RR GRAPH ----------------------------
 class RrGraph extends StatelessWidget {
   final List<int> rr;
 
@@ -360,6 +415,149 @@ class AccGraph extends StatelessWidget {
             barWidth: 2,
             dotData: FlDotData(show: false),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// RECORDING LIST + REPLAY PAGES
+////////////////////////////////////////////////////////////////////////////////
+
+class RecordingListPage extends StatefulWidget {
+  const RecordingListPage({super.key});
+
+  @override
+  State<RecordingListPage> createState() => _RecordingListPageState();
+}
+
+class _RecordingListPageState extends State<RecordingListPage> {
+  final recorder = RecordingManager();
+  List<Directory> sessions = [];
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    sessions = await recorder.listRecordings();
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("Saved Recordings")),
+      body: ListView(
+        children: [
+          for (final dir in sessions)
+            ListTile(
+              title: Text(dir.path.split("/").last),
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => ReplayPage(folder: dir.path),
+                  ),
+                );
+              },
+            )
+        ],
+      ),
+    );
+  }
+}
+
+class ReplayPage extends StatefulWidget {
+  final String folder;
+  const ReplayPage({super.key, required this.folder});
+
+  @override
+  State<ReplayPage> createState() => _ReplayPageState();
+}
+
+class _ReplayPageState extends State<ReplayPage> {
+  final recorder = RecordingManager();
+
+  List<double> ecg = [];
+  List<int> rr = [];
+  List<int> hr = [];
+  List<Map<String, double>> acc = [];
+  Map<String, dynamic>? metadata;
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    final data = await recorder.loadRecording(widget.folder);
+
+    metadata = data["metadata"];
+
+    ecg = data["ecg"]
+        .map<double>((line) => double.parse(line.split(",")[1]))
+        .toList();
+
+    rr = data["rr"]
+        .map<int>((line) => int.parse(line.split(",")[1]))
+        .toList();
+
+    acc = data["acc"].map<Map<String, double>>((line) {
+      final parts = line.split(",");
+      return {
+        "x": double.parse(parts[1]),
+        "y": double.parse(parts[2]),
+        "z": double.parse(parts[3]),
+      };
+    }).toList();
+
+    hr = data["hr"]
+        .map<int>((line) => int.parse(line.split(",")[1]))
+        .toList();
+
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (metadata == null) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(title: const Text("Replay Recording")),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Text("Metadata:"),
+          Text(metadata.toString()),
+
+          const SizedBox(height: 20),
+
+          const Text("ECG"),
+          SizedBox(height: 180, child: EcgGraph(data: ecg)),
+
+          const SizedBox(height: 20),
+
+          const Text("RR Intervals"),
+          SizedBox(height: 180, child: RrGraph(rr: rr)),
+
+          const SizedBox(height: 20),
+
+          const Text("Heart Rate"),
+          SizedBox(height: 180, child: HrGraph(hrList: hr)),
+
+          const SizedBox(height: 20),
+
+          const Text("ACC"),
+          SizedBox(height: 180, child: AccGraph(data: acc)),
         ],
       ),
     );
